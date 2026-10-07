@@ -3,7 +3,9 @@ package com.hedge257;
 import org.junit.jupiter.api.Test;
 
 import java.time.LocalDate;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -274,5 +276,165 @@ class Hedge257Test {
         assertThrows(IllegalArgumentException.class,
                 () -> pricer.price(beyondCurve, settle, r.curve(), 0.01, 1,
                         List.of()));
+    }
+
+    private static HedgeInput hedgeInput(double budget, double min, double max) {
+        LocalDate v = LocalDate.of(2026, 6, 28);
+        LocalDate settle = LocalDate.of(2026, 10, 6);
+        List<DepositQuote> deposits = deposits();
+        List<SwapQuote> swaps = swaps();
+        Bond callableBond = new Bond(LocalDate.of(2025, 1, 14),
+                List.of(LocalDate.of(2027, 1, 14), LocalDate.of(2027, 4, 24),
+                        LocalDate.of(2027, 8, 2)),
+                100.0, 0.06);
+        List<CallPrice> calls = List.of(
+                new CallPrice(LocalDate.of(2027, 1, 14), 101.50),
+                new CallPrice(LocalDate.of(2027, 4, 24), 100.75));
+        HedgePosition callable = new HedgePosition("H-CALL", callableBond, 8.0,
+                calls, 0.012, 100);
+        Bond bond3y = new Bond(LocalDate.of(2024, 6, 28),
+                List.of(LocalDate.of(2027, 6, 28), LocalDate.of(2028, 6, 28),
+                        LocalDate.of(2029, 6, 28)),
+                100.0, 0.04);
+        HedgeCandidate candidate = new HedgeCandidate("C-3Y", bond3y, min, max);
+        Map<String, Double> limits = new LinkedHashMap<>();
+        limits.put("D3M", 0.05);
+        limits.put("D6M", 0.05);
+        limits.put("S1Y", 0.10);
+        limits.put("S2Y", 0.15);
+        limits.put("S3Y", 0.20);
+        return new HedgeInput(v, settle, deposits, swaps, List.of(callable),
+                List.of(candidate), limits, budget);
+    }
+
+    @Test
+    void hedgeRecomputesExposureAndCallableTreeRisk() {
+        HedgeResult result = new HedgeEngine(TIGHT).hedge(hedgeInput(10000.0, -100.0, 100.0));
+        assertEquals(5, result.bucketCount());
+        assertEquals(1, result.candidateCount());
+        for (double dv : result.dv01Before()) {
+            assertTrue(Double.isFinite(dv));
+        }
+        double beforeWorst = 0.0;
+        for (int k = 0; k < result.bucketCount(); k++) {
+            beforeWorst = Math.max(beforeWorst,
+                    Math.abs(result.dv01Before().get(k)) / result.dv01Before().size());
+        }
+        assertTrue(beforeWorst > 0.0);
+        double x = result.quantities()[0];
+        double dirty = result.unitDirtyPrices()[0];
+        assertTrue(dirty > 0.0);
+        assertTrue(result.turnover() <= result.budget() + 1.0e-7);
+        assertEquals(Math.abs(x) * dirty, result.turnover(), 1.0e-6);
+        double recomputedWorst = 0.0;
+        for (int k = 0; k < result.bucketCount(); k++) {
+            double expected = result.dv01Before().get(k) + result.riskMatrix()[k][0] * x;
+            assertEquals(expected, result.dv01After().get(k), 1.0e-8);
+            double limit = List.of(0.05, 0.05, 0.10, 0.15, 0.20).get(k);
+            recomputedWorst = Math.max(recomputedWorst, Math.abs(expected) / limit);
+        }
+        assertEquals(recomputedWorst, result.worstResidual(), 1.0e-9);
+    }
+
+    @Test
+    void hedgeRespectsBindingBudgetAndAllowsShorts() {
+        double tightBudget = 50.0;
+        HedgeResult result = new HedgeEngine(TIGHT).hedge(hedgeInput(tightBudget, -100.0, 100.0));
+        assertEquals(tightBudget, result.turnover(), 1.0e-6);
+        assertTrue(result.quantities()[0] < 0.0);
+    }
+
+    @Test
+    void hedgeWithZeroBudgetDeliversZeroTrades() {
+        HedgeResult result = new HedgeEngine(TIGHT).hedge(hedgeInput(0.0, -100.0, 100.0));
+        assertEquals(0.0, result.quantities()[0], 0.0);
+        assertEquals(0.0, result.turnover(), 0.0);
+        for (int k = 0; k < result.bucketCount(); k++) {
+            assertEquals(result.dv01Before().get(k), result.dv01After().get(k), 0.0);
+        }
+    }
+
+    @Test
+    void contradictoryBoundsAndMissingAndNonPositiveLimitsAreRejected() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new HedgeCandidate("X",
+                        new Bond(V, List.of(LocalDate.of(2027, 6, 28)), 100.0, 0.0),
+                        1.0, -1.0));
+        HedgeInput missingLimit = hedgeInput(1.0, -1.0, 1.0);
+        Map<String, Double> noD3m = new LinkedHashMap<>(missingLimit.limits());
+        noD3m.remove("D3M");
+        assertThrows(IllegalArgumentException.class,
+                () -> new HedgeInput(missingLimit.valueDate(), missingLimit.settlementDate(),
+                        missingLimit.deposits(), missingLimit.swaps(), missingLimit.positions(),
+                        missingLimit.candidates(), noD3m, 1.0));
+        Map<String, Double> zeroLimit = new LinkedHashMap<>(missingLimit.limits());
+        zeroLimit.put("D3M", 0.0);
+        assertThrows(IllegalArgumentException.class,
+                () -> new HedgeInput(missingLimit.valueDate(), missingLimit.settlementDate(),
+                        missingLimit.deposits(), missingLimit.swaps(), missingLimit.positions(),
+                        missingLimit.candidates(), zeroLimit, 1.0));
+        Map<String, Double> unknownLimit = new LinkedHashMap<>(missingLimit.limits());
+        unknownLimit.put("GHOST", 1.0);
+        assertThrows(IllegalArgumentException.class,
+                () -> new HedgeInput(missingLimit.valueDate(), missingLimit.settlementDate(),
+                        missingLimit.deposits(), missingLimit.swaps(), missingLimit.positions(),
+                        missingLimit.candidates(), unknownLimit, 1.0));
+        assertThrows(IllegalArgumentException.class, () -> hedgeInput(-0.01, -1.0, 1.0));
+    }
+
+    @Test
+    void duplicateHedgeIdsAreRejected() {
+        HedgeInput base = hedgeInput(1.0, -1.0, 1.0);
+        Bond bond = new Bond(V, List.of(LocalDate.of(2027, 6, 28)), 100.0, 0.0);
+        HedgeCandidate duplicate = new HedgeCandidate("D3M", bond, -1.0, 1.0);
+        assertThrows(IllegalArgumentException.class,
+                () -> new HedgeInput(base.valueDate(), base.settlementDate(),
+                        base.deposits(), base.swaps(), base.positions(),
+                        List.of(base.candidates().get(0), duplicate),
+                        base.limits(), 1.0));
+        HedgePosition duplicateHolding = new HedgePosition("C-3Y", bond, 1.0);
+        assertThrows(IllegalArgumentException.class,
+                () -> new HedgeInput(base.valueDate(), base.settlementDate(),
+                        base.deposits(), base.swaps(),
+                        List.of(base.positions().get(0), duplicateHolding),
+                        base.candidates(), base.limits(), 1.0));
+    }
+
+    @Test
+    void infeasibleHedgeIsReportedSeparatelyFromRevaluationFailure() {
+        assertThrows(HedgeInfeasibleException.class,
+                () -> new HedgeEngine(TIGHT).hedge(hedgeInput(0.5, 0.01, 1.0)));
+
+        LocalDate v = LocalDate.of(2026, 6, 28);
+        LocalDate settle = LocalDate.of(2026, 10, 6);
+        DepositQuote extreme = new DepositQuote("D6M", LocalDate.of(2026, 12, 28), -1.9945);
+        List<DepositQuote> deposits = List.of(
+                new DepositQuote("D3M", LocalDate.of(2026, 9, 28), 0.020), extreme);
+        Bond callableBond = new Bond(LocalDate.of(2025, 1, 14),
+                List.of(LocalDate.of(2027, 1, 14), LocalDate.of(2027, 4, 24),
+                        LocalDate.of(2027, 8, 2)),
+                100.0, 0.06);
+        HedgePosition callable = new HedgePosition("H-CALL", callableBond, 8.0,
+                List.of(new CallPrice(LocalDate.of(2027, 1, 14), 101.50),
+                        new CallPrice(LocalDate.of(2027, 4, 24), 100.75)),
+                0.012, 100);
+        Bond bond3y = new Bond(LocalDate.of(2024, 6, 28),
+                List.of(LocalDate.of(2027, 6, 28), LocalDate.of(2028, 6, 28),
+                        LocalDate.of(2029, 6, 28)),
+                100.0, 0.04);
+        Map<String, Double> limits = new LinkedHashMap<>();
+        limits.put("D3M", 0.05);
+        limits.put("D6M", 0.05);
+        limits.put("S1Y", 0.10);
+        limits.put("S2Y", 0.15);
+        limits.put("S3Y", 0.20);
+        HedgeInput input = new HedgeInput(v, settle, deposits, swaps(), List.of(callable),
+                List.of(new HedgeCandidate("C-3Y", bond3y, -100.0, 100.0)),
+                limits, 10000.0);
+        HedgeFailureException failure = assertThrows(HedgeFailureException.class,
+                () -> new HedgeEngine(TIGHT).hedge(input));
+        assertEquals("D6M", failure.quoteId());
+        assertEquals("-", failure.contractId());
+        assertTrue(failure.getMessage().contains("down-shift curve bootstrap failed"));
     }
 }

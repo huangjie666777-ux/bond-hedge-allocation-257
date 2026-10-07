@@ -77,11 +77,45 @@ Console Standalone 1.10.3。要求 JDK 17 与 GNU Make。
 结算日 2026-10-06、100 天等步长、`sigma=1.20%`、两个赎回日（101.50、100.75），
 并打印无赎回曲线价/树价、可赎回全价/净价、赎回权成本、校准残差与各节点行权结果。
 
+## 预算内债券组合对冲
+
+`HedgeEngine.hedge(HedgeInput)` 在原曲线引导、债券估值、DV01 与可赎回树定价链之上实现
+预算内对冲编排，不修改任何输入，无前端、无 HTTP：
+
+- 输入（`HedgeInput`）：估值日、结算日、存款与互换报价（合计 1–20 条），持仓 1–20 个、
+  候选 1–12 个，以及逐报价桶正的有限风险限额 `L` 与非负有限成交预算 `B`。
+- 持仓（`HedgePosition`）给唯一 ID、`Bond` 与带符号连续数量（单位为百元面值，与
+  `Bond.faceValue` 无关）；可附原赎回表、波动率 `sigma` 与等步长天数，附赎回表即为
+  可赎回持仓。候选（`HedgeCandidate`）仅为普通 `Bond`，给唯一 ID 与交易量上下限。
+- 校验拒绝重复 ID（报价/持仓/候选统一查重）、缺失或非正限额、未知报价限额、
+  非有限/负预算、矛盾交易边界、非有限数量与越界数量上限。
+- 逐报价独立上下扰动 1 bp 并重新引导整条曲线；每百元净价 DV01 =
+  `(P(下移) - P(上移)) / 2`。可赎回持仓在两个扰动曲线上都重新校准短率树并重新判断
+  各节点行权，不冻结策略，也不平移折现率。汇总带符号组合暴露 `b`，候选风险矩阵为
+  `H[桶][候选]`；任一方向引导或重估失败抛 `HedgeFailureException`，带报价 ID、合同 ID
+  与原因，不删桶、不填零。
+- 优化为全局线性规划（Commons Math `SimplexSolver`）：最小化
+  `max_k |b_k + (Hx)_k| / L_k`，满足 `min_j ≤ x_j ≤ max_j`（允许空头）与
+  `Σ_j 全价_j · |x_j| ≤ B`（卖出同样占预算）。`x_j = u_j - v_j`、`u,v ≥ 0` 精确处理
+  绝对值，允许重复或线性相关候选；引入辅助变量 `z ≥ |标准化残余|` 得标准 LP。
+- 无解（`HedgeInfeasibleException`）与数值失败（`HedgeNumericalException`，含求解
+  不收敛、非有限结果、求解后按数量独立复核交易边界/预算/残余失败）严格分开；
+  任何失败都不交付部分交易。
+- 结果（`HedgeResult`）按候选顺序返回买卖数量、候选原每百元全价、逐桶对冲前后 DV01、
+  风险矩阵 `H`、最坏标准化残余与成交额；全部残余与成交额均按返回数量重新核算。
+
+`make run` 的第二部分在受限预算 `B=300` 下展示含上述 6% 可赎回持仓（数量 8）加一只
+普通 3Y 持仓（数量 5）的对冲：预算被用满，1Y 零息候选卖出、3Y 候选卖出，逐桶打印
+对冲前后 DV01 与 `|残余| / L`。
+
 ## 包结构
 
 `src/main/java/com/hedge257/`：`DayCount`、`Validate`、`CurveConfig`、`DepositQuote`、
 `SwapQuote`、`DiscountCurve`、`CurveBootstrapper`、`BootstrapResult`、`InstrumentRepricing`、
 `BootstrapException`、`Bond`、`BondCashflow`、`BondPrice`、`BondPricer`、`QuoteDv01`、
 `Dv01Report`、`RiskEngine`、`ShortRateTree`、`TreeCalibrationException`、`CallPrice`、
-`CallableBondPrice`、`CallNodeSnapshot`、`CallableBondPricer`、`Main`。
+`CallableBondPrice`、`CallNodeSnapshot`、`CallableBondPricer`、`HedgeInput`、
+`HedgePosition`、`HedgeCandidate`、`HedgeResult`、`HedgeFailureException`、
+`HedgeInfeasibleException`、`HedgeNumericalException`、`HedgeOptimizer`、`HedgeEngine`、
+`Main`。
 自测：`src/test/java/com/hedge257/Hedge257Test.java`。
