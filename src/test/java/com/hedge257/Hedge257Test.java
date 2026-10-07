@@ -275,4 +275,111 @@ class Hedge257Test {
                 () -> pricer.price(beyondCurve, settle, r.curve(), 0.01, 1,
                         List.of()));
     }
+
+    @Test
+    void hedgesCallablePortfolioUnderBindingBudgetAndVerifiesResult() {
+        LocalDate settle = LocalDate.of(2026, 10, 6);
+        Bond callableBond = new Bond(LocalDate.of(2025, 1, 14),
+                List.of(LocalDate.of(2026, 1, 14), LocalDate.of(2027, 1, 14),
+                        LocalDate.of(2027, 4, 24), LocalDate.of(2027, 8, 2)),
+                100.0, 0.06);
+        List<CallPrice> calls = List.of(
+                new CallPrice(LocalDate.of(2027, 1, 14), 101.50),
+                new CallPrice(LocalDate.of(2027, 4, 24), 100.75));
+        Bond twoYear = new Bond(LocalDate.of(2024, 6, 28),
+                List.of(LocalDate.of(2025, 6, 28), LocalDate.of(2026, 6, 28),
+                        LocalDate.of(2027, 6, 28), LocalDate.of(2028, 6, 28)),
+                100.0, 0.04);
+        Bond threeYear = new Bond(LocalDate.of(2024, 6, 28),
+                List.of(LocalDate.of(2025, 6, 28), LocalDate.of(2026, 6, 28),
+                        LocalDate.of(2027, 6, 28), LocalDate.of(2028, 6, 28),
+                        LocalDate.of(2029, 6, 28)), 100.0, 0.04);
+        HedgeRequest request = new HedgeRequest(V, settle, deposits(), swaps(),
+                List.of(Holding.callable("CALL", callableBond, 10.0, calls, 0.012, 100)),
+                List.of(new Candidate("C2", twoYear, -8.0, 8.0),
+                        new Candidate("C3", threeYear, -8.0, 8.0)),
+                List.of(4.0, 4.0, 4.0, 4.0, 4.0), 50.0);
+
+        HedgeSolution solution = new HedgeService(TIGHT).hedge(request);
+
+        assertEquals(List.of("C2", "C3"), solution.candidateIds());
+        assertEquals(List.of("D3M", "D6M", "S1Y", "S2Y", "S3Y"),
+                solution.quoteIds());
+        assertTrue(Math.abs(solution.quantities()[0]) > 1.0e-8
+                || Math.abs(solution.quantities()[1]) > 1.0e-8);
+        assertTrue(solution.turnover() <= 50.0 + 1.0e-7);
+        assertTrue(solution.turnover() >= 50.0 - 1.0e-5);
+        double recomputedTurnover = 0.0;
+        double worst = 0.0;
+        Dv01Report twoYearRisk = new RiskEngine(TIGHT).dv01(V, deposits(), swaps(),
+                twoYear, settle);
+        Dv01Report threeYearRisk = new RiskEngine(TIGHT).dv01(V, deposits(), swaps(),
+                threeYear, settle);
+        for (int bucket = 0; bucket < solution.quoteIds().size(); bucket++) {
+            double residual = solution.beforeDv01()[bucket]
+                    + solution.quantities()[0] * twoYearRisk.results().get(bucket).dv01()
+                    + solution.quantities()[1] * threeYearRisk.results().get(bucket).dv01();
+            for (int candidate = 0; candidate < 2; candidate++) {
+                assertTrue(solution.quantities()[candidate] >= -8.0 - 1.0e-8);
+                assertTrue(solution.quantities()[candidate] <= 8.0 + 1.0e-8);
+            }
+            assertEquals(residual, solution.afterDv01()[bucket], 1.0e-8);
+            worst = Math.max(worst, Math.abs(solution.afterDv01()[bucket]) / 4.0);
+        }
+        assertEquals(worst, solution.worstStandardizedResidual(), 1.0e-8);
+        BootstrapResult base = new CurveBootstrapper(TIGHT).bootstrap(V, deposits(), swaps());
+        recomputedTurnover += new BondPricer().price(twoYear, settle, base.curve()).dirtyPrice()
+                * Math.abs(solution.quantities()[0]);
+        recomputedTurnover += new BondPricer().price(threeYear, settle, base.curve()).dirtyPrice()
+                * Math.abs(solution.quantities()[1]);
+        assertEquals(recomputedTurnover, solution.turnover(), 1.0e-7);
+    }
+
+    @Test
+    void distinguishesInfeasibleBudgetFromValuationFailureAndValidatesContract() {
+        LocalDate settle = LocalDate.of(2026, 10, 6);
+        Bond bond = new Bond(LocalDate.of(2024, 6, 28),
+                List.of(LocalDate.of(2025, 6, 28), LocalDate.of(2026, 6, 28),
+                        LocalDate.of(2027, 6, 28), LocalDate.of(2028, 6, 28)),
+                100.0, 0.04);
+        HedgeRequest forcedButNoBudget = new HedgeRequest(V, settle, deposits(), swaps(),
+                List.of(Holding.plain("H", bond, 1.0)),
+                List.of(new Candidate("C", bond, 1.0, 8.0)),
+                List.of(4.0, 4.0, 4.0, 4.0, 4.0), 0.0);
+        assertThrows(InfeasibleHedgeException.class,
+                () -> new HedgeService(TIGHT).hedge(forcedButNoBudget));
+
+        List<CallPrice> calls = List.of(new CallPrice(LocalDate.of(2027, 1, 14), 101.5));
+        Bond callableBond = new Bond(LocalDate.of(2025, 1, 14),
+                List.of(LocalDate.of(2026, 1, 14), LocalDate.of(2027, 1, 14),
+                        LocalDate.of(2027, 4, 24), LocalDate.of(2027, 8, 2)),
+                100.0, 0.06);
+        HedgeRequest badTree = new HedgeRequest(V, settle, deposits(), swaps(),
+                List.of(Holding.callable("CALL", callableBond, 1.0, calls, 0.012, 99)),
+                List.of(new Candidate("C", bond, -8.0, 8.0)),
+                List.of(4.0, 4.0, 4.0, 4.0, 4.0), 1000.0);
+        HedgeValuationException failure = assertThrows(HedgeValuationException.class,
+                () -> new HedgeService(TIGHT).hedge(badTree));
+        assertTrue(failure.failures().stream().anyMatch(f -> f.quoteId().equals("S3Y")
+                && f.instrumentId().equals("CALL")));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> new Candidate("C", bond, 2.0, 1.0));
+        assertThrows(IllegalArgumentException.class,
+                () -> new HedgeRequest(V, settle, deposits(), swaps(),
+                        List.of(Holding.plain("H", bond, 1.0),
+                                Holding.plain("H", bond, 1.0)),
+                        List.of(new Candidate("C", bond, -1.0, 1.0)),
+                        List.of(4.0, 4.0, 4.0, 4.0, 4.0), 1.0));
+        assertThrows(IllegalArgumentException.class,
+                () -> new HedgeRequest(V, settle, deposits(), swaps(),
+                        List.of(Holding.plain("H", bond, 1.0)),
+                        List.of(new Candidate("C", bond, -1.0, 1.0)),
+                        List.of(4.0, 4.0, 4.0, 4.0), 1.0));
+        assertThrows(IllegalArgumentException.class,
+                () -> new HedgeRequest(V, settle, deposits(), swaps(),
+                        List.of(Holding.plain("H", bond, 1.0)),
+                        List.of(new Candidate("C", bond, -1.0, 1.0)),
+                        List.of(4.0, 0.0, 4.0, 4.0, 4.0), 1.0));
+    }
 }

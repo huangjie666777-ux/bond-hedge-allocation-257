@@ -77,11 +77,43 @@ Console Standalone 1.10.3。要求 JDK 17 与 GNU Make。
 结算日 2026-10-06、100 天等步长、`sigma=1.20%`、两个赎回日（101.50、100.75），
 并打印无赎回曲线价/树价、可赎回全价/净价、赎回权成本、校准残差与各节点行权结果。
 
+## 预算内债券组合对冲
+
+`HedgeService.hedge(HedgeRequest)` 在原曲线、债券与可赎回定价链上求解预算内组合对冲：
+
+- `Holding` 的 `quantity` 是带符号、连续的百元面值数量；负号表示空头。可附
+  `List<CallPrice>`、`sigma` 与等步长天数。候选用普通 `Bond` 构造 `Candidate`，
+  给定带符号交易量上下限；卖出和买入都允许。
+- 输入最多 20 个持仓、12 个候选和 20 条报价。所有报价桶必须有正、有限的 `L`，
+  预算 `B` 必须有限非负；数量、上下限及模型价格也要求有限。重复报价 ID、重复
+  持仓/候选 ID、缺失限额和 `minQuantity > maxQuantity` 均在定价前拒绝。
+- 风险以报价为桶：每条存款或互换分别独立 `-1bp/+1bp`，两个方向都重新引导整条曲线。
+  每百元 DV01 为 `(净价(-1bp) - 净价(+1bp)) / 2`；组合暴露 `b` 按带符号数量汇总，
+  候选矩阵 `H` 是每百元 DV01。可赎回持仓在基准、下移和上移曲线上分别重新校准短率树
+  并重新判断每个赎回节点，不冻结行权策略，也不平移折现率。
+- 任一基准或扰动重估失败时抛出 `HedgeValuationException`，其中 `RiskFailure` 同时带
+  报价桶 ID、合同/曲线 ID 与原因；不会删桶，也不会把风险填零。
+- LP 使用变量 `x+ >= 0`、`x- >= 0`，令 `x = x+ - x-`，目标最小化
+  `max_k |b_k + H_k x| / L_k`。约束包含候选上下限、双重绝对值残余不等式和
+  `Σ 原每百元全价_i * (x+_i + x-_i) <= B`，因此空头同样占用成交额预算。
+  Commons Math 单纯形是全局线性优化；允许空头、重复候选和线性相关候选，同目标解任取。
+- `NoFeasibleSolutionException` 转换为 `InfeasibleHedgeException`；其他优化器错误转换为
+  `HedgeNumericalException`。求解后按返回数量重新计算残余、最坏标准化残余和成交额，
+  并验证上下限与预算；验证失败不返回部分交易。
+- `HedgeSolution` 按候选输入顺序返回带符号买卖数量，按报价顺序返回对冲前后 DV01，
+  以及最坏标准化残余和全价成交额。
+
+`make run` 的末段使用 10 个百元面值单位的 6% 可赎回持仓和两只普通国债候选，展示
+100 元全价成交额预算受限、候选允许双向交易时的对冲结果、逐桶前后 DV01 和实际成交额。
+
 ## 包结构
 
 `src/main/java/com/hedge257/`：`DayCount`、`Validate`、`CurveConfig`、`DepositQuote`、
 `SwapQuote`、`DiscountCurve`、`CurveBootstrapper`、`BootstrapResult`、`InstrumentRepricing`、
 `BootstrapException`、`Bond`、`BondCashflow`、`BondPrice`、`BondPricer`、`QuoteDv01`、
 `Dv01Report`、`RiskEngine`、`ShortRateTree`、`TreeCalibrationException`、`CallPrice`、
-`CallableBondPrice`、`CallNodeSnapshot`、`CallableBondPricer`、`Main`。
+`CallableBondPrice`、`CallNodeSnapshot`、`CallableBondPricer`、`Holding`、`Candidate`、
+`HedgeRequest`、`RiskFailure`、`HedgeValuationException`、`HedgeRiskModel`、
+`InfeasibleHedgeException`、`HedgeNumericalException`、`HedgeOptimizer`、`HedgeSolution`、
+`HedgeService`、`Main`。
 自测：`src/test/java/com/hedge257/Hedge257Test.java`。

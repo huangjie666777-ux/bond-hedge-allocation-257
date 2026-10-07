@@ -114,5 +114,37 @@ public final class Main {
                     snapshot.nodeIndex(), snapshot.shortRate(), snapshot.continuationValue(),
                     snapshot.exercised() ? "CALLED" : "continue");
         }
+
+        Bond twoYearHedge = new Bond(LocalDate.of(2024, 6, 28),
+                List.of(LocalDate.of(2025, 6, 28), LocalDate.of(2026, 6, 28),
+                        LocalDate.of(2027, 6, 28), LocalDate.of(2028, 6, 28)),
+                100.0, 0.0400);
+        Bond threeYearHedge = new Bond(LocalDate.of(2024, 6, 28),
+                List.of(LocalDate.of(2025, 6, 28), LocalDate.of(2026, 6, 28),
+                        LocalDate.of(2027, 6, 28), LocalDate.of(2028, 6, 28),
+                        LocalDate.of(2029, 6, 28)), 100.0, 0.0400);
+        HedgeRequest hedgeRequest = new HedgeRequest(
+                valueDate, callableSettlement, deposits, swaps,
+                List.of(Holding.callable("CALLABLE-6%", callableBond, 10.0,
+                        callSchedule, sigma, stepDays)),
+                List.of(new Candidate("HEDGE-2Y", twoYearHedge, -8.0, 8.0),
+                        new Candidate("HEDGE-3Y", threeYearHedge, -8.0, 8.0)),
+                List.of(5.0, 5.0, 5.0, 5.0), 100.0);
+        HedgeSolution hedge = new HedgeService(config).hedge(hedgeRequest);
+
+        System.out.println();
+        System.out.println("budgeted portfolio hedge (quantities are 100-face units)");
+        System.out.println("cash budget (full-price turnover, shorts also count): 100.00");
+        for (int i = 0; i < hedge.candidateIds().size(); i++) {
+            System.out.printf("  %-9s signed trade = %+.6f%n",
+                    hedge.candidateIds().get(i), hedge.quantities()[i]);
+        }
+        System.out.println("bucket DV01 before and after hedge:");
+        for (int i = 0; i < hedge.quoteIds().size(); i++) {
+            System.out.printf("  %-8s before=%+10.6f after=%+10.6f%n",
+                    hedge.quoteIds().get(i), hedge.beforeDv01()[i], hedge.afterDv01()[i]);
+        }
+        System.out.printf("worst |residual| / L: %.8f%n", hedge.worstStandardizedResidual());
+        System.out.printf("full-price turnover:  %.8f%n", hedge.turnover());
     }
 }
